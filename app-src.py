@@ -25,6 +25,23 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 
 # =========================== 环境变量 ===========================
+def _env_int(name, default, lo=1, hi=65535):
+    """安全解析端口类环境变量：非法值回退默认值并告警，避免 import 期直接崩溃"""
+    raw = os.environ.get(name, '')
+    if raw in ('', None):
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (ValueError, TypeError):
+        sys.stdout.write(f'WARN: invalid {name}={raw!r}, using default {default}\n')
+        sys.stdout.flush()
+        return default
+    if not (lo <= value <= hi):
+        sys.stdout.write(f'WARN: {name}={value} out of range [{lo},{hi}], using default {default}\n')
+        sys.stdout.flush()
+        return default
+    return value
+
 UPLOAD_URL = os.environ.get('UPLOAD_URL', '')          # 节点或订阅上传地址
 PROJECT_URL = os.environ.get('PROJECT_URL', '')        # 项目url,用于自动保活或上传订阅
 AUTO_ACCESS = os.environ.get('AUTO_ACCESS', '').lower() == 'true'  # true开启自动保活,默认关闭
@@ -55,19 +72,23 @@ CFP_DEBUG = os.environ.get('CFP_DEBUG', '0')           # 调试日志 0|1
 BUILTIN_XRAY = os.environ.get('BUILTIN_XRAY', '/opt/bin/web')
 BUILTIN_BOT = os.environ.get('BUILTIN_BOT', '/opt/bin/bot')
 BUILTIN_CFP = os.environ.get('BUILTIN_CFP', '/opt/bin/cfprobe')
+# 可选：远程下载二进制时的 sha256 校验（留空不校验；内置二进制来自可信构建可不填）
+XRAY_SHA256 = os.environ.get('XRAY_SHA256', '').lower()
+CLOUDFLARED_SHA256 = os.environ.get('CLOUDFLARED_SHA256', '').lower()
+CFPROBE_SHA256 = os.environ.get('CFPROBE_SHA256', '').lower()
 
 ARGO_DOMAIN = os.environ.get('ARGO_DOMAIN', '')        # Argo固定隧道域名,留空使用临时隧道
 ARGO_AUTH = os.environ.get('ARGO_AUTH', '')            # Argo固定隧道token或json,留空使用临时隧道
-ARGO_PORT = int(os.environ.get('ARGO_PORT', '8001'))   # Argo隧道端口
+ARGO_PORT = _env_int('ARGO_PORT', 8001)   # Argo隧道端口
 S5_PORT = os.environ.get('S5_PORT', '')                # socks5端口,留空不开启
 HY2_PORT = os.environ.get('HY2_PORT', '')              # hy2端口,留空不开启
 REALITY_PORT = os.environ.get('REALITY_PORT', '')      # reality端口,留空不开启
 CFIP = os.environ.get('CFIP', 'saas.sin.fan')         # 优选ip或域名
-CFPORT = int(os.environ.get('CFPORT', '443'))          # 优选端口
+CFPORT = _env_int('CFPORT', 443)          # 优选端口
 NAME = os.environ.get('NAME', '')                      # 节点名称
 CHAT_ID = os.environ.get('CHAT_ID', '')                # Telegram chat_id
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')            # Telegram bot_token
-PORT = int(os.environ.get('PORT') or '3000')           # http订阅端口
+PORT = _env_int('PORT', 3000)           # http订阅端口
 SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')  # 是否显示日志,默认显示，no/false/disable 不显示
 
 # =========================== 日志控制 ===========================
@@ -149,7 +170,6 @@ def generate_or_load_keypair():
         if priv_match and pub_match:
             private_key = priv_match.group(1).strip()
             public_key = pub_match.group(1).strip()
-            log(f'Private Key: {private_key}')
             log(f'Public Key: {public_key}')
             return
     keypair = generate_x25519_keypair()
@@ -157,36 +177,11 @@ def generate_or_load_keypair():
     public_key = keypair['publicKey']
     key_file_path.write_text(
         f'PrivateKey: {private_key}\nPublicKey: {public_key}\n', encoding='utf-8')
-    log(f'Private Key: {private_key}')
     log(f'Public Key: {public_key}')
 
 # =========================== TLS 证书生成 ===========================
-FALLBACK_EC_KEY = (
-    '-----BEGIN EC PARAMETERS-----\n'
-    'BggqhkjOPQMBBw==\n'
-    '-----END EC PARAMETERS-----\n'
-    '-----BEGIN EC PRIVATE KEY-----\n'
-    'MHcCAQEEIM4792SEtPqIt1ywqTd/0bYidBqpYV/++siNnfBYsdUYoAoGCCqGSM49\n'
-    'AwEHoUQDQgAE1kHafPj07rJG+HboH2ekAI4r+e6TL38GWASANnngZreoQDF16ARa\n'
-    '/TsyLyFoPkhLxSbehH/NBEjHtSZGaDhMqQ==\n'
-    '-----END EC PRIVATE KEY-----\n'
-)
-
-FALLBACK_CERT = (
-    '-----BEGIN CERTIFICATE-----\n'
-    'MIIBejCCASGgAwIBAgIUfWeQL3556PNJLp/veCFxGNj9crkwCgYIKoZIzj0EAwIw\n'
-    'EzERMA8GA1UEAwwIYmluZy5jb20wHhcNMjUwOTE4MTgyMDIyWhcNMzUwOTE2MTgy\n'
-    'MDIyWjATMREwDwYDVQQDDAhiaW5nLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEH\n'
-    'A0IABNZB2nz49O6yRvh26B9npACOK/nuky9/BlgEgDZ54Ga3qEAxdegEWv07Mi8h\n'
-    'aD5IS8Um3oR/zQRIx7UmRmg4TKmjUzBRMB0GA1UdDgQWBBTV1cFID7UISE7PLTBR\n'
-    'BfGbgkrMNzAfBgNVHSMEGDAWgBTV1cFID7UISE7PLTBRBfGbgkrMNzAPBgNVHRMB\n'
-    'Af8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIAIDAJvg0vd/ytrQVvEcSm6XTlB+\n'
-    'eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==\n'
-    '-----END CERTIFICATE-----\n'
-)
-
 def ensure_tls_certificates(cert_file, key_file):
-    """生成自签名 TLS 证书 (用于 Hysteria2)"""
+    """生成自签名 TLS 证书 (用于 Hysteria2)；失败时抛错，由调用方降级处理"""
     if cert_file.exists() and key_file.exists():
         return
     cert_file.parent.mkdir(parents=True, exist_ok=True)
@@ -214,9 +209,10 @@ def ensure_tls_certificates(cert_file, key_file):
         key_file.write_bytes(key_pem)
         cert_file.write_bytes(cert_pem)
     except Exception as e:
+        # 不再使用硬编码私钥做 fallback：所有走 fallback 的实例会共用同一套证书私钥。
+        # 抛错让调用方决定降级策略（start_server 会禁用 Hysteria2 并继续运行）。
         log_error(f'Failed to generate TLS certificate: {e}')
-        key_file.write_text(FALLBACK_EC_KEY, encoding='utf-8')
-        cert_file.write_text(FALLBACK_CERT, encoding='utf-8')
+        raise
 
 # =========================== 证书指纹计算 ===========================
 def get_certificate_fingerprint(cert_file):
@@ -295,7 +291,24 @@ def get_system_architecture():
     return 'amd'
 
 # =========================== 下载文件 ===========================
-def download_file(file_name, file_url):
+def _verify_sha256(file_path, expected):
+    """校验文件 sha256；expected 为空表示不校验"""
+    if not expected:
+        return True
+    import hashlib
+    digest = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            digest.update(chunk)
+    actual = digest.hexdigest().lower()
+    if actual != expected.lower():
+        log_error(f'sha256 mismatch for {file_path.name}: expected {expected}, got {actual}')
+        return False
+    log(f'sha256 verified: {file_path.name}')
+    return True
+
+
+def download_file(file_name, file_url, sha256=''):
     file_path = FILE_PATH / file_name
     try:
         response = requests.get(file_url, stream=True, timeout=180)
@@ -303,6 +316,12 @@ def download_file(file_name, file_url):
         with open(file_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+        if not _verify_sha256(file_path, sha256):
+            try:
+                file_path.unlink()
+            except FileNotFoundError:
+                pass
+            return False
         log(f'Download {file_name} successfully')
         return True
     except Exception as e:
@@ -342,7 +361,7 @@ def prepare_or_download_binaries():
     if not _copy_builtin(BUILTIN_XRAY, web_path):
         downloaded = False
         for index, base_url in enumerate(base_urls):
-            if download_file(web_name, f'{base_url}/web'):
+            if download_file(web_name, f'{base_url}/web', XRAY_SHA256):
                 downloaded = True
                 break
             if index + 1 < len(base_urls):
@@ -355,7 +374,7 @@ def prepare_or_download_binaries():
     if not _copy_builtin(BUILTIN_BOT, bot_path):
         downloaded = False
         for index, base_url in enumerate(base_urls):
-            if download_file(bot_name, f'{base_url}/bot'):
+            if download_file(bot_name, f'{base_url}/bot', CLOUDFLARED_SHA256):
                 downloaded = True
                 break
             if index + 1 < len(base_urls):
@@ -376,7 +395,7 @@ def prepare_or_download_binaries():
             ]
             downloaded = False
             for url in cf_urls:
-                if download_file(cf_probe_name, url):
+                if download_file(cf_probe_name, url, CFPROBE_SHA256):
                     downloaded = True
                     break
             if not downloaded:
@@ -398,17 +417,6 @@ def live_binary(runtime_path, builtin_path):
     return str(p)
 
 
-# =========================== 授权文件执行权限 ===========================
-def authorize_files(file_names):
-    for name in file_names:
-        file_path = FILE_PATH / name
-        if file_path.exists():
-            try:
-                os.chmod(str(file_path), 0o775)
-                log(f'Empowerment success for {name}: 775')
-            except Exception as e:
-                log_error(f'Empowerment failed for {name}: {e}')
-
 # =========================== Argo 隧道配置 ===========================
 def argo_type():
     if not ARGO_AUTH or not ARGO_DOMAIN:
@@ -417,7 +425,14 @@ def argo_type():
 
     if 'TunnelSecret' in ARGO_AUTH:
         (FILE_PATH / 'tunnel.json').write_text(ARGO_AUTH, encoding='utf-8')
-        tunnel_id = ARGO_AUTH.split('"')[11]
+        try:
+            tunnel_id = json.loads(ARGO_AUTH).get('TunnelID') or ''
+        except Exception as e:
+            log_error(f'ARGO_AUTH JSON 解析失败，请检查 TunnelID 字段: {e}')
+            return
+        if not tunnel_id:
+            log_error('ARGO_AUTH JSON 中缺少 TunnelID，已跳过固定隧道配置')
+            return
         tunnel_yaml = f"""
 tunnel: {tunnel_id}
 credentials-file: {FILE_PATH / 'tunnel.json'}
@@ -636,20 +651,40 @@ def generate_xray_config():
 
     config_path.write_text(json.dumps(config, indent=2), encoding='utf-8')
 
-# =========================== 执行命令 ===========================
-def exec_cmd(command):
+# =========================== 进程启动（无 shell，防命令注入） ===========================
+def run_daemon(argv, log_path=None):
+    """以后台守护进程方式启动程序。
+
+    argv 为参数列表（不经过 shell），天然免疫命令注入；
+    start_new_session + DEVNULL 实现 nohup 语义，父进程退出不影响子进程。
+    """
     try:
-        process = subprocess.Popen(
-            command, shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+        if log_path:
+            out = open(str(log_path), 'ab')
+            err = subprocess.STDOUT
+        else:
+            out = subprocess.DEVNULL
+            err = subprocess.DEVNULL
+        subprocess.Popen(
+            [str(a) for a in argv],
+            stdin=subprocess.DEVNULL,
+            stdout=out, stderr=err,
+            start_new_session=True, close_fds=True,
         )
-        stdout, stderr = process.communicate()
-        return stdout + stderr
+        return True
     except Exception as e:
-        log_error(f'Error executing command: {e}')
-        return str(e)
+        log_error(f'Failed to start daemon {argv[0] if argv else "?"}: {e}')
+        return False
+
+
+def pkill_match(pattern):
+    """按命令行特征结束进程（列表形式调用 pkill，不经过 shell）"""
+    try:
+        subprocess.run(['pkill', '-f', pattern],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+    except Exception:
+        pass
 
 # =========================== 下载并运行 ===========================
 def download_files_and_run():
@@ -658,120 +693,94 @@ def download_files_and_run():
     architecture = get_system_architecture()
     log(f'architecture: {architecture}, binaries prepared')
 
-    # 生成并运行 CF 探针 (cf-probe)
+    # 生成并运行 CF 探针 (cf-probe)：配置由 generate_cf_probe_config() 统一生成
     if CFP_ID and CFP_SECRET and CFP_URL:
-        cf_conf = (
-            f'SERVER_ID="{CFP_ID}"\n'
-            f'SECRET="{CFP_SECRET}"\n'
-            f'WORKER_URL="{CFP_URL}"\n'
-            f'COLLECT_INTERVAL="{CFP_COLLECT}"\n'
-            f'REPORT_INTERVAL="{CFP_INTERVAL}"\n'
-            f'CT_NODE="{CFP_CT}"\n'
-            f'CU_NODE="{CFP_CU}"\n'
-            f'CM_NODE="{CFP_CM}"\n'
-            f'BD_NODE="{CFP_BD}"\n'
-            f'NODE_1="{CFP_NODE1}"\n'
-            f'NODE_2="{CFP_NODE2}"\n'
-            f'NODE_3="{CFP_NODE3}"\n'
-            f'NODE_4="{CFP_NODE4}"\n'
-            f'INTERFACE="{CFP_IFACE}"\n'
-            f'RESET_DAY="{CFP_RESET_DAY}"\n'
-            f'CONNECTION_MODE="{CFP_CONN_MODE}"\n'
-            f'PING_MODE="{CFP_PING_MODE}"\n'
-            f'AUTO_UPDATE="0"\n'
-            f'CONFIG_MD5="none"\n'
-        )
-        cf_probe_config_path.write_text(cf_conf, encoding='utf-8')
+        generate_cf_probe_config()
         debug_arg = '-debug=1' if CFP_DEBUG == '1' else '-debug=0'
         cfp_bin = live_binary(cf_probe_path, BUILTIN_CFP)
-        command = (
-            f'nohup {cfp_bin} run -config "{cf_probe_config_path}" {debug_arg} '
-            f'>/dev/null 2>&1 &'
-        )
-        try:
-            exec_cmd(command)
+        if run_daemon([cfp_bin, 'run', '-config', str(cf_probe_config_path), debug_arg]):
             log(f'{cf_probe_name} (cf-probe) is running')
             time.sleep(1)
-        except Exception as e:
-            log_error(f'cf-probe running error: {e}')
     else:
         log('CFP_ID/CFP_SECRET/CFP_URL not all set, skip running probe')
 
     # 运行 Xray
     web_bin = live_binary(web_path, BUILTIN_XRAY)
-    command = f'nohup {web_bin} -c {config_path} >/dev/null 2>&1 &'
-    try:
-        exec_cmd(command)
+    if run_daemon([web_bin, '-c', str(config_path)]):
         log(f'{web_name} is running')
         time.sleep(1)
-    except Exception as e:
-        log_error(f'web running error: {e}')
 
-    # 运行 Cloudflared
+    # 运行 Cloudflared（参数列表形式传递，ARGO_AUTH 不经过 shell，无注入风险）
     bot_bin = live_binary(bot_path, BUILTIN_BOT)
     if Path(bot_bin).is_file():
-        if re.match(r'^[A-Z0-9a-z=]{120,250}$', ARGO_AUTH):
-            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token {ARGO_AUTH}"
-        elif "TunnelSecret" in ARGO_AUTH:
-            args = f"tunnel --edge-ip-version auto --config {FILE_PATH / 'tunnel.yml'} run"
+        auth = ARGO_AUTH or ''
+        if re.match(r'^[A-Z0-9a-z=]{120,250}$', auth):
+            argv = [bot_bin, 'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
+                    '--protocol', 'http2', 'run', '--token', auth]
+        elif 'TunnelSecret' in auth:
+            argv = [bot_bin, 'tunnel', '--edge-ip-version', 'auto',
+                    '--config', str(FILE_PATH / 'tunnel.yml'), 'run']
         else:
-            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info --url http://localhost:{ARGO_PORT}"
+            if auth:
+                log_error('ARGO_AUTH 格式无法识别（既不是 token 也不是 TunnelSecret JSON），已降级为临时隧道')
+            argv = [bot_bin, 'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
+                    '--protocol', 'http2', '--logfile', str(boot_log_path),
+                    '--loglevel', 'info', '--url', f'http://localhost:{ARGO_PORT}']
 
-        try:
-            exec_cmd(f'nohup "{bot_bin}" {args} >/dev/null 2>&1 &')
+        if run_daemon(argv):
             log(f'{bot_name} is running')
             time.sleep(2)
-        except Exception as e:
-            log_error(f'Error executing command: {e}')
 
     time.sleep(5)
 
 
 # =========================== 提取隧道域名 ===========================
-def extract_domains():
-    argo_domain = None
+def extract_domains(max_retries=5):
+    """提取 Argo 隧道域名。
 
+    固定隧道直接使用 ARGO_DOMAIN；临时隧道从 cloudflared 日志解析，
+    最多重试 max_retries 次（原递归无上限，会在网络持续异常时无限循环）。
+    全部失败时仍生成非 Argo 节点（Hysteria2/Reality/Socks5），不整体崩溃。
+    """
     if ARGO_AUTH and ARGO_DOMAIN:
-        argo_domain = ARGO_DOMAIN
-        log(f'ARGO_DOMAIN: {argo_domain}')
-        generate_links(argo_domain)
-    else:
+        log(f'ARGO_DOMAIN: {ARGO_DOMAIN}')
+        generate_links(ARGO_DOMAIN)
+        return
+
+    argo_domain = None
+    for attempt in range(1, max_retries + 1):
         try:
             if boot_log_path.exists():
-                file_content = boot_log_path.read_text(encoding='utf-8')
-                lines = file_content.split('\n')
-                argo_domains = []
-
-                for line in lines:
-                    domain_match = re.search(r'https?://([^ ]*trycloudflare\.com)/?', line)
-                    if domain_match:
-                        domain = domain_match.group(1)
-                        argo_domains.append(domain)
-
-                if argo_domains:
-                    argo_domain = argo_domains[0]
-                    log(f'ArgoDomain: {argo_domain}')
-                    generate_links(argo_domain)
-                else:
-                    log('ArgoDomain not found, re-running bot to obtain ArgoDomain')
-                    try:
-                        boot_log_path.unlink()
-                    except FileNotFoundError:
-                        pass
-
-                    try:
-                        exec_cmd(f'pkill -f "[{bot_name[0]}]{bot_name[1:]}" > /dev/null 2>&1')
-                    except Exception:
-                        pass
-
-                    time.sleep(3)
-                    args = f'tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info --url http://localhost:{ARGO_PORT}'
-                    exec_cmd(f'nohup "{live_binary(bot_path, BUILTIN_BOT)}" {args} >/dev/null 2>&1 &')
-                    log(f'{bot_name} is running')
-                    time.sleep(6)
-                    extract_domains()
+                found = re.findall(
+                    r'https?://([^ ]*trycloudflare\.com)/?',
+                    boot_log_path.read_text(encoding='utf-8'))
+                if found:
+                    argo_domain = found[0]
+                    break
         except Exception as e:
             log_error(f'Error reading boot.log: {e}')
+        if attempt < max_retries:
+            log(f'ArgoDomain not found (attempt {attempt}/{max_retries}), re-running bot')
+            try:
+                boot_log_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            pkill_match(bot_name)
+            time.sleep(3)
+            argv = [live_binary(bot_path, BUILTIN_BOT), 'tunnel',
+                    '--edge-ip-version', 'auto', '--no-autoupdate',
+                    '--protocol', 'http2', '--logfile', str(boot_log_path),
+                    '--loglevel', 'info', '--url', f'http://localhost:{ARGO_PORT}']
+            if run_daemon(argv):
+                log(f'{bot_name} is running')
+            time.sleep(6)
+
+    if argo_domain:
+        log(f'ArgoDomain: {argo_domain}')
+        generate_links(argo_domain)
+    else:
+        log_error(f'ArgoDomain not found after {max_retries} attempts; continuing without argo nodes')
+        generate_links(None)
 
 # =========================== 获取 ISP 信息 ===========================
 def get_meta_info():
@@ -823,6 +832,8 @@ def generate_links(argo_domain):
 
     isp = get_meta_info()
     node_name = f'{NAME}-{isp}' if NAME else isp
+    # 节点名出现在 URL fragment 中，中文/空格需编码，否则部分客户端解析异常
+    node_name_enc = quote(node_name, safe='')
     server_ip = get_server_ip()
 
     time.sleep(2)
@@ -831,7 +842,7 @@ def generate_links(argo_domain):
 
     # Argo 节点 (VLESS / VMess / Trojan)
     if argo_domain:
-        sub_txt += f'\nvless://{UUID}@{CFIP}:{CFPORT}?encryption=none&security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Fvless-argo%3Fed%3D2560#{node_name}'
+        sub_txt += f'\nvless://{UUID}@{CFIP}:{CFPORT}?encryption=none&security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Fvless-argo%3Fed%3D2560#{node_name_enc}'
 
         vmess_obj = {
             'v': '2', 'ps': node_name, 'add': CFIP, 'port': CFPORT,
@@ -842,22 +853,22 @@ def generate_links(argo_domain):
         vmess_b64 = base64.b64encode(json.dumps(vmess_obj, separators=(',', ':')).encode()).decode()
         sub_txt += f'\nvmess://{vmess_b64}'
 
-        sub_txt += f'\ntrojan://{UUID}@{CFIP}:{CFPORT}?security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Ftrojan-argo%3Fed%3D2560#{node_name}'
+        sub_txt += f'\ntrojan://{UUID}@{CFIP}:{CFPORT}?security=tls&sni={argo_domain}&fp=firefox&type=ws&host={argo_domain}&path=%2Ftrojan-argo%3Fed%3D2560#{node_name_enc}'
 
     # Hysteria2 节点
     if is_valid_port(HY2_PORT):
         fingerprint = get_certificate_fingerprint(cert_path)
         fingerprint_param = f'&pinSHA256={quote(fingerprint, safe="")}' if fingerprint else ''
-        sub_txt += f'\nhysteria2://{UUID}@{server_ip}:{HY2_PORT}/?sni=www.bing.com&insecure=0&alpn=h3&obfs=none{fingerprint_param}#{node_name}'
+        sub_txt += f'\nhysteria2://{UUID}@{server_ip}:{HY2_PORT}/?sni=www.bing.com&insecure=0&alpn=h3&obfs=none{fingerprint_param}#{node_name_enc}'
 
     # Reality 节点
     if is_valid_port(REALITY_PORT):
-        sub_txt += f'\nvless://{UUID}@{server_ip}:{REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={public_key}&type=tcp&headerType=none#{node_name}'
+        sub_txt += f'\nvless://{UUID}@{server_ip}:{REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={public_key}&type=tcp&headerType=none#{node_name_enc}'
 
     # SOCKS5 节点
     if is_valid_port(S5_PORT):
         s5_auth = base64.b64encode(f'{UUID[:8]}:{UUID[-12:]}'.encode()).decode()
-        sub_txt += f'\nsocks://{s5_auth}@{server_ip}:{S5_PORT}#{node_name}'
+        sub_txt += f'\nsocks://{s5_auth}@{server_ip}:{S5_PORT}#{node_name_enc}'
 
     sub_txt_b64 = base64.b64encode(sub_txt.encode()).decode()
     if SHOW_LOG:
@@ -963,6 +974,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path == f'/{SUB_PATH}':
+            if not sub_txt_content:
+                # 节点尚未生成（启动后约十几秒空窗期），返回 503 而不是空订阅
+                self.send_response(503)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.send_header('Retry-After', '10')
+                self.end_headers()
+                self.wfile.write(b'Nodes not ready yet, please retry later')
+                return
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain; charset=utf-8')
             self.end_headers()
@@ -973,8 +992,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(
-                b'Hello world!<br><br>You can access /{SUB_PATH}(Default: /sub) get your nodes!')
+            homepage = (f'Hello world!<br><br>You can access /{SUB_PATH}'
+                        f'(Default: /sub) get your nodes!').encode('utf-8')
+            self.wfile.write(homepage)
             return
 
         self.send_response(404)
@@ -987,7 +1007,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 # =========================== 主流程 ===========================
 def start_server():
-    global sub_txt_content
+    global sub_txt_content, HY2_PORT
 
     # 1. 删除旧节点
     delete_nodes()
@@ -1003,9 +1023,13 @@ def start_server():
     if is_valid_port(REALITY_PORT):
         generate_or_load_keypair()
 
-    # 5. 生成 TLS 证书 (用于 Hysteria2)
+    # 5. 生成 TLS 证书 (用于 Hysteria2)；失败则禁用 Hysteria2，保证其它协议正常运行
     if is_valid_port(HY2_PORT):
-        ensure_tls_certificates(cert_path, key_path)
+        try:
+            ensure_tls_certificates(cert_path, key_path)
+        except Exception as e:
+            log_error(f'TLS certificate generation failed, disabling Hysteria2: {e}')
+            HY2_PORT = ''
 
     # 6. 生成 Xray 配置
     generate_xray_config()
@@ -1029,13 +1053,10 @@ def stop_all(signum=None, frame=None):
     """优雅关闭所有服务"""
     def shutdown():
         log('\nShutting down...')
-        try:
-            exec_cmd(f'pkill -f "{web_name}" > /dev/null 2>&1')
-            exec_cmd(f'pkill -f "{bot_name}" > /dev/null 2>&1')
-            if CFP_ID and CFP_SECRET and CFP_URL:
-                exec_cmd(f'pkill -f "{cf_probe_name}" > /dev/null 2>&1')
-        except Exception:
-            pass
+        pkill_match(web_name)
+        pkill_match(bot_name)
+        if CFP_ID and CFP_SECRET and CFP_URL:
+            pkill_match(cf_probe_name)
         time.sleep(1)
         os._exit(0)
 

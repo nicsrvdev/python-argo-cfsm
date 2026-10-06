@@ -8,6 +8,9 @@
 FROM golang:1.26-alpine AS binbuilder
 ARG TARGETPLATFORM
 ARG CFSM_AGENT_REPO=https://github.com/huilang-me/cfsm-agent.git
+# 可选：构建时校验下载的二进制（docker build --build-arg XRAY_SHA256=...）
+ARG XRAY_SHA256=""
+ARG CLOUDFLARED_SHA256=""
 RUN apk add --no-cache curl ca-certificates git >/dev/null && mkdir -p /opt/bin
 
 RUN case "$TARGETPLATFORM" in \
@@ -23,6 +26,8 @@ RUN ARCH=$(cat /arch); \
         if curl -fsSL --connect-timeout 15 -o "/opt/bin/${BIN}" "${URL}"; then break; fi; \
       done; \
     done; \
+    if [ -n "$XRAY_SHA256" ]; then echo "$XRAY_SHA256  /opt/bin/web" | sha256sum -c -; fi; \
+    if [ -n "$CLOUDFLARED_SHA256" ]; then echo "$CLOUDFLARED_SHA256  /opt/bin/bot" | sha256sum -c -; fi; \
     chmod +x /opt/bin/web /opt/bin/bot && \
     ls -la /opt/bin
 
@@ -40,9 +45,7 @@ RUN git clone --depth 1 "$CFSM_AGENT_REPO" /src/cfsm-agent && \
 
 FROM python:3.10-alpine
 WORKDIR /app
-RUN apk update && apk upgrade && \
-    apk add --no-cache openssl curl bash gcompat iproute2 coreutils ca-certificates && \
-    chmod +x /tmp || true
+RUN apk add --no-cache openssl curl bash gcompat iproute2 coreutils ca-certificates
 
 COPY --from=binbuilder /opt/bin/web /opt/bin/web
 COPY --from=binbuilder /opt/bin/bot /opt/bin/bot

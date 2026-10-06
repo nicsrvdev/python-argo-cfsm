@@ -39,7 +39,7 @@ docker run -d --name python-argo-cfsm \
 ```
 
 - 书签首页：`http://<主机>:3000/`
-- 订阅地址：`http://<主机>:3000/sub`
+- 订阅地址：`http://<主机>:3000/sub`（启动后约十几秒节点生成完成，之前访问返回 503，稍后重试即可）
 
 非 Docker（PaaS / 游戏平台玩具）：上传 `app.py` + `requirements.txt`，`pip install -r requirements.txt` 后 `python3 app.py`，变量用环境变量注入（见下表）。
 
@@ -50,7 +50,7 @@ docker run -d --name python-argo-cfsm \
 本项目的部署方式有三种，**凭据处理方式不同**：
 
 - **方式一：常规 Python 环境**（例如游戏平台玩具）
-  - 只需上传 `app.py` 和 `requirements.txt` 两个文件，`app.py` 授权 `777`，变量通过环境变量注入
+  - 只需上传 `app.py` 和 `requirements.txt` 两个文件，`app.py` 授权 `755`，变量通过环境变量注入
 - **方式二：文件 + 命令结合**
   - 上传 `app.py` 和 `requirements.txt`，先运行 `chmod +x app.py`，再运行 `pip install -r requirements.txt`，然后运行 `screen python3 app.py` 即可。提示 screen not found 说明 screen 未安装，Debian/Ubuntu 安装命令：`apt install -y screen`，CentOS 安装命令：`yum install -y screen`
 - **方式三：Docker 部署**
@@ -83,6 +83,7 @@ docker run -d --name python-argo-cfsm \
 | `FILE_PATH` | `.cache` | 运行目录，节点存放路径 |
 | `CHAT_ID` / `BOT_TOKEN` | 空 | Telegram 节点推送（两变量同填生效） |
 | `SHOW_LOG` | `true` | 是否显示日志，默认显示，`false` / `disable` / `no` 屏蔽 |
+| `XRAY_SHA256` / `CLOUDFLARED_SHA256` / `CFPROBE_SHA256` | 空 | 远程下载二进制时的 sha256 校验值，留空不校验；Docker 构建时也可用 `--build-arg` 传入同名参数校验 |
 
 ### 探针（CF-Server-Monitor）
 
