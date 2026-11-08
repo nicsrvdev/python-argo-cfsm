@@ -1,0 +1,22 @@
+# 主进程被杀 / 容器退出 / 宿主机重启后，Docker 自动拉起整个容器。
+# 容器内的 xray / cloudflared / cf-probe 子进程由 app.py 内置看门狗管，
+# 两层配合才算完整：compose 管主进程，看门狗管子进程。
+services:
+  python-argo-cfsm:
+    build: .
+    image: python-argo-cfsm:latest
+    container_name: python-argo-cfsm
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      UUID: "${UUID:-20e6e496-cf19-45c8-b883-14f5e11cd9f1}"
+      CFP_ID: "${CFP_ID:-}"
+      CFP_SECRET: "${CFP_SECRET:-}"
+      CFP_URL: "${CFP_URL:-}"
+      ARGO_AUTH: "${ARGO_AUTH:-}"
+      ARGO_DOMAIN: "${ARGO_DOMAIN:-}"
+      # 看门狗默认开启；要关：WATCHDOG_ENABLED=false
+      # WATCHDOG_INTERVAL: "15"
+      # 探针上报间隔默认 180 秒；要更实时：CFP_INTERVAL=60
+      # CFP_INTERVAL: "180"

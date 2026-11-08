@@ -27,7 +27,7 @@ docker pull ghcr.io/nicsrvdev/python-argo-cfsm:latest
 ## 快速使用
 
 ```bash
-docker run -d --name python-argo-cfsm \
+docker run -d --name python-argo-cfsm --restart=unless-stopped \
   -e UUID="你的UUID" \
   -e CFP_ID="CF面板服务器ID" \
   -e CFP_SECRET="CF面板密钥" \
@@ -36,6 +36,15 @@ docker run -d --name python-argo-cfsm \
   -e ARGO_DOMAIN="固定隧道域名(留空=临时隧道)" \
   -p 3000:3000 \
   ghcr.io/nicsrvdev/python-argo-cfsm:latest
+```
+
+`--restart=unless-stopped` 是必须的：主进程被杀 / 容器退出 / 宿主机重启后由 Docker 拉起整个容器；容器内的 xray / cloudflared / cf-probe 子进程由 `app.py` 内置看门狗管（见下）。只加一边都不完整。
+
+也可以用 compose（已含 `restart: unless-stopped`）：
+
+```bash
+UUID="你的UUID" CFP_ID="..." CFP_SECRET="..." CFP_URL="https://你的worker域名/update" \
+  ARGO_AUTH="..." ARGO_DOMAIN="..." docker compose up -d
 ```
 
 - 书签首页：`http://<主机>:3000/`
@@ -58,6 +67,8 @@ docker run -d --name python-argo-cfsm \
 
 > 三种方式都走环境变量注入；如 fork 后硬编码变量再公开，请注意不要把探针密钥、隧道 token 留在公开仓库。
 - cf-probe 在容器/平台内以 `run -config` 前台模式运行（无需 systemd），三进程各自随机文件名，90 秒后清理运行副本（进程不受影响）
+- **自动拉起（两层）**：`app.py` 内置看门狗每 15 秒（`WATCHDOG_INTERVAL`）巡检 xray / cloudflared / cf-probe，死了按 5s/10s/20s/40s/60s 指数退避重启，连续存活 60 秒清零计数；临时隧道重启后会重新解析新域名并重写订阅，固定隧道直接重启。90 秒清理不再删 `config.json` / `cfprobe.conf` / `tunnel.yml`（看门狗重启要靠它们），二进制副本删了也能从 `/opt/bin` 回退。关看门狗：`WATCHDOG_ENABLED=false`。主进程层面靠 Docker `--restart=unless-stopped` / compose 的 `restart`。
+- **瘦身**：`cryptography` 只在 Reality / Hysteria2 需要时才加载，纯 Argo 部署不占那份内存；WS 入站去掉了无路由意义的 `sniffing`；`CFP_INTERVAL` 默认 60→180 秒；镜像砍掉 `bash` / `iproute2` / `coreutils` / `gcompat`，不再把 `app-src.py` 复制进镜像；Go 二进制加了 `GOGC=20` / `GOMEMLIMIT=64MiB`。
 
 ---
 
@@ -79,6 +90,8 @@ docker run -d --name python-argo-cfsm \
 | `NAME` | 空 | 节点名称前缀，例如 `Koyeb Fly` |
 | `S5_PORT` / `HY2_PORT` / `REALITY_PORT` | 空 | 额外协议端口，填写即开启 |
 | `PORT` | `3000` | http 服务监听端口，也是订阅端口 |
+| `WATCHDOG_ENABLED` | `true` | 子进程看门狗开关，`false` 关闭 |
+| `WATCHDOG_INTERVAL` | `15` | 看门狗巡检间隔（秒），5–300 |
 | `SUB_PATH` | `sub` | 订阅路径 |
 | `FILE_PATH` | `.cache` | 运行目录，节点存放路径 |
 | `CHAT_ID` / `BOT_TOKEN` | 空 | Telegram 节点推送（两变量同填生效） |
@@ -94,7 +107,7 @@ docker run -d --name python-argo-cfsm \
 | `CFP_ID` | 空 | 服务器 ID，CF 面板添加服务器后获取 |
 | `CFP_SECRET` | 空 | 服务器密钥 |
 | `CFP_URL` | 空 | Worker 上报地址，如 `https://example.com/update` |
-| `CFP_INTERVAL` | `60` | 上报间隔（秒） |
+| `CFP_INTERVAL` | `180` | 上报间隔（秒） |
 | `CFP_COLLECT` | `0` | 采样间隔（秒），`0`=WSS 自动采样 |
 | `CFP_CT` / `CFP_CU` / `CFP_CM` / `CFP_BD` | 空 | 电信/联通/移动/BGP 测试节点，host 或 host:port |
 | `CFP_NODE1..4` | 空 | 自定义探测节点 |

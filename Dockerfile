@@ -45,15 +45,24 @@ RUN git clone --depth 1 "$CFSM_AGENT_REPO" /src/cfsm-agent && \
 
 FROM python:3.10-alpine
 WORKDIR /app
-RUN apk add --no-cache openssl curl bash gcompat iproute2 coreutils ca-certificates
+# 只留真正用到的包：openssl（证书指纹）+ curl（取公网 IP 的兜底）+ ca-certificates；
+# bash / iproute2 / coreutils / gcompat 在 app.py 里没有任何调用，已砍掉。
+RUN apk add --no-cache openssl curl ca-certificates
 
 COPY --from=binbuilder /opt/bin/web /opt/bin/web
 COPY --from=binbuilder /opt/bin/bot /opt/bin/bot
 COPY --from=binbuilder /opt/bin/cfprobe /opt/bin/cfprobe
 
+# app-src.py 是仓库里的干净源码，不进镜像（与 app.py 完全重复，省一份拷贝）
 COPY app.py requirements.txt /app/
-COPY app-src.py /app/app-src.py
 RUN pip install --no-cache-dir -r requirements.txt && chmod +x /app/app.py
 
+# 压 Go 二进制（cloudflared / cf-probe）的堆增长，省内存；GOGC 越小回收越勤
+ENV GOGC=20 GOMEMLIMIT=64MiB
+
 EXPOSE 3000/tcp
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:${PORT:-3000}/ || exit 1
+# 注意：容器重启策略不在镜像里，见 docker-compose.yml 的 restart: unless-stopped
+# （主进程被杀 / 宿主机重启后由 Docker 拉起整个容器；容器内的子进程由 app.py 看门狗管）
 CMD ["python3", "/app/app.py"]

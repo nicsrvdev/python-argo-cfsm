@@ -19,10 +19,9 @@ import requests
 from pathlib import Path
 from urllib.parse import urlparse, quote
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from cryptography.hazmat.primitives.asymmetric import x25519, ec
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography import x509
-from cryptography.x509.oid import NameOID
+# 注意：cryptography 只在 Reality / Hysteria2 需要时才懒加载（见
+# generate_x25519_keypair / ensure_tls_certificates / get_certificate_fingerprint），
+# 纯 Argo 部署不加载它，省约 20MB+ 常驻内存。
 
 # =========================== 环境变量 ===========================
 def _env_int(name, default, lo=1, hi=65535):
@@ -52,7 +51,7 @@ UUID = os.environ.get('UUID', '20e6e496-cf19-45c8-b883-14f5e11cd9f1')  # UUID
 CFP_ID = os.environ.get('CFP_ID', '')                  # Server ID，必填
 CFP_SECRET = os.environ.get('CFP_SECRET', '')          # 服务器密钥，必填
 CFP_URL = os.environ.get('CFP_URL', '')                # Worker 上报地址，必填 例如 https://example.com/update
-CFP_INTERVAL = os.environ.get('CFP_INTERVAL', '60')    # 上报间隔，秒
+CFP_INTERVAL = os.environ.get('CFP_INTERVAL', '180')   # 上报间隔，秒（默认 180，省探针连接/采样开销；面板实时性要求高可改回 60）
 CFP_COLLECT = os.environ.get('CFP_COLLECT', '0')       # 采样间隔，秒
 CFP_CT = os.environ.get('CFP_CT', '')                  # 电信测试节点
 CFP_CU = os.environ.get('CFP_CU', '')                  # 联通测试节点
@@ -90,6 +89,8 @@ CHAT_ID = os.environ.get('CHAT_ID', '')                # Telegram chat_id
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')            # Telegram bot_token
 PORT = _env_int('PORT', 3000)           # http订阅端口
 SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')  # 是否显示日志,默认显示，no/false/disable 不显示
+WATCHDOG_ENABLED = os.environ.get('WATCHDOG_ENABLED', 'true').lower() not in ('false', 'disable', 'no')  # 看门狗：子进程死后自动拉起，默认开启
+WATCHDOG_INTERVAL = _env_int('WATCHDOG_INTERVAL', 15, lo=5, hi=300)  # 看门狗巡检间隔，秒
 
 # =========================== 日志控制 ===========================
 def log(msg):
@@ -143,6 +144,8 @@ def is_valid_port(port):
 # =========================== X25519 密钥对生成 ===========================
 def generate_x25519_keypair():
     """使用 cryptography 库生成 X25519 密钥对,返回 base64url 编码的私钥和公钥"""
+    from cryptography.hazmat.primitives.asymmetric import x25519
+    from cryptography.hazmat.primitives import serialization
     priv = x25519.X25519PrivateKey.generate()
     pub = priv.public_key()
     priv_bytes = priv.private_bytes(
@@ -186,6 +189,10 @@ def ensure_tls_certificates(cert_file, key_file):
         return
     cert_file.parent.mkdir(parents=True, exist_ok=True)
     try:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
         ec_private_key = ec.generate_private_key(ec.SECP256R1())
         subject = issuer = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, 'bing.com')
@@ -230,6 +237,8 @@ def get_certificate_fingerprint(cert_file):
     except Exception:
         pass
     try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
         with open(cert_file, 'rb') as f:
             cert_data = f.read()
         cert = x509.load_pem_x509_certificate(cert_data)
@@ -528,11 +537,6 @@ def generate_xray_config():
                     "network": "ws",
                     "security": "none",
                     "wsSettings": {"path": "/vless-argo"}
-                },
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
-                    "metadataOnly": False
                 }
             },
             {
@@ -546,11 +550,6 @@ def generate_xray_config():
                 "streamSettings": {
                     "network": "ws",
                     "wsSettings": {"path": "/vmess-argo"}
-                },
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
-                    "metadataOnly": False
                 }
             },
             {
@@ -565,11 +564,6 @@ def generate_xray_config():
                     "network": "ws",
                     "security": "none",
                     "wsSettings": {"path": "/trojan-argo"}
-                },
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
-                    "metadataOnly": False
                 }
             }
         ],
@@ -653,28 +647,38 @@ def generate_xray_config():
 
 # =========================== 进程启动（无 shell，防命令注入） ===========================
 def run_daemon(argv, log_path=None):
-    """以后台守护进程方式启动程序。
+    """以后台守护进程方式启动程序，返回 Popen 对象（失败返回 None）。
 
     argv 为参数列表（不经过 shell），天然免疫命令注入；
     start_new_session + DEVNULL 实现 nohup 语义，父进程退出不影响子进程。
+    注意：返回的 Popen 对象必须由调用方保存（见 _start_child），丢掉它
+    就没人知道子进程死活——这就是以前子进程被杀后不自动拉起的根因。
     """
+    log_file = None
     try:
         if log_path:
-            out = open(str(log_path), 'ab')
+            log_file = open(str(log_path), 'ab')
+            out = log_file
             err = subprocess.STDOUT
         else:
             out = subprocess.DEVNULL
             err = subprocess.DEVNULL
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [str(a) for a in argv],
             stdin=subprocess.DEVNULL,
             stdout=out, stderr=err,
             start_new_session=True, close_fds=True,
         )
-        return True
+        proc._log_file = log_file
+        return proc
     except Exception as e:
+        if log_file is not None:
+            try:
+                log_file.close()
+            except Exception:
+                pass
         log_error(f'Failed to start daemon {argv[0] if argv else "?"}: {e}')
-        return False
+        return None
 
 
 def pkill_match(pattern):
@@ -685,6 +689,190 @@ def pkill_match(pattern):
                        timeout=10)
     except Exception:
         pass
+
+
+# =========================== 子进程跟踪 + 看门狗 ===========================
+# _children: name -> {'proc': Popen, 'argv': [...], 'started_at': float}
+# name 只有三个：'xray' / 'cloudflared' / 'cfprobe'。看门狗每
+# WATCHDOG_INTERVAL 秒 poll() 一次，死了按指数退避重启（5s/10s/20s/40s/60s封顶，
+# 配置坏了也不会 tight loop 刷屏）；连续存活 60 秒以上清零失败计数。
+_children = {}
+_children_lock = threading.Lock()
+_shutdown_event = threading.Event()
+_watchdog_started = False
+_watchdog_failures = {}
+
+_CHILD_PATTERNS = {'xray': web_name, 'cloudflared': bot_name,
+                   'cfprobe': cf_probe_name}  # name -> pkill 用的随机文件名
+
+
+def _child_pattern(name):
+    return _CHILD_PATTERNS.get(name, '')
+
+
+def _start_child(name, argv, log_path=None):
+    """启动并登记一个子进程，返回 Popen（失败返回 None）。"""
+    proc = run_daemon(argv, log_path=log_path)
+    if proc is None:
+        return None
+    with _children_lock:
+        _children[name] = {'proc': proc, 'argv': [str(a) for a in argv],
+                           'started_at': time.monotonic()}
+    return proc
+
+
+def _stop_child(name):
+    """优雅停一个已登记的子进程（terminate → 5s 超时 kill），再 pkill 兜底清孤儿。"""
+    with _children_lock:
+        record = _children.get(name)
+    proc = record['proc'] if record else None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    log_file = getattr(proc, '_log_file', None) if proc is not None else None
+    if log_file is not None:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+    pattern = _child_pattern(name)
+    if pattern:
+        pkill_match(pattern)
+
+
+def _resolve_argv(argv):
+    """重启时把已被 90 秒清理删掉的运行副本路径换回内置二进制。
+
+    clean_files() 会删 .cache/<随机名> 三个副本，进程本身不受影响，但按原
+    argv 重启会 FileNotFoundError；live_binary() 在副本没了时回退 /opt/bin。
+    """
+    if not argv:
+        return argv
+    resolved = list(argv)
+    runtime_to_builtin = {
+        str(web_path): BUILTIN_XRAY,
+        str(bot_path): BUILTIN_BOT,
+        str(cf_probe_path): BUILTIN_CFP,
+    }
+    builtin = runtime_to_builtin.get(str(resolved[0]))
+    if builtin:
+        resolved[0] = live_binary(resolved[0], builtin)
+    return resolved
+
+
+def _cloudflared_argv():
+    """构造 cloudflared 启动参数，返回 (argv, is_temp_tunnel)。"""
+    bot_bin = live_binary(bot_path, BUILTIN_BOT)
+    auth = ARGO_AUTH or ''
+    if re.match(r'^[A-Z0-9a-z=]{120,250}$', auth):
+        return ([bot_bin, 'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
+                 '--protocol', 'http2', 'run', '--token', auth], False)
+    if 'TunnelSecret' in auth:
+        return ([bot_bin, 'tunnel', '--edge-ip-version', 'auto',
+                 '--config', str(FILE_PATH / 'tunnel.yml'), 'run'], False)
+    if auth:
+        log_error('ARGO_AUTH 格式无法识别（既不是 token 也不是 TunnelSecret JSON），已降级为临时隧道')
+    return ([bot_bin, 'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
+             '--protocol', 'http2', '--logfile', str(boot_log_path),
+             '--loglevel', 'info', '--url', f'http://localhost:{ARGO_PORT}'], True)
+
+
+def _wait_temp_domain(timeout=30):
+    """等 cloudflared 把临时域名写进 boot.log，返回域名或 None。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if boot_log_path.exists():
+                found = re.findall(
+                    r'https?://([^ ]*trycloudflare\.com)/?',
+                    boot_log_path.read_text(encoding='utf-8'))
+                if found:
+                    return found[0]
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+
+def _restart_child(name):
+    """拉起一个已死的子进程。返回 True 表示进程已起来（临时隧道还需域名就绪）。"""
+    with _children_lock:
+        record = _children.get(name)
+    if not record:
+        return False
+    argv = _resolve_argv(record['argv'])
+    if name == 'xray' and not config_path.exists():
+        generate_xray_config()
+    elif name == 'cfprobe' and not cf_probe_config_path.exists():
+        generate_cf_probe_config()
+    elif name == 'cloudflared' and 'TunnelSecret' in (ARGO_AUTH or ''):
+        if not (FILE_PATH / 'tunnel.yml').exists():
+            argo_type()
+    if name == 'cloudflared' and '--url' in argv:
+        # 临时隧道（--url 形式）：旧 boot.log 里是过期域名，必须清掉再起，否则会误用旧域名
+        try:
+            boot_log_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    proc = _start_child(name, argv)
+    if proc is None:
+        log_error(f'watchdog: failed to restart {name}')
+        return False
+    log(f'watchdog: {name} restarted (pid {proc.pid})')
+    if name == 'cloudflared':
+        _argv, is_temp = _cloudflared_argv()
+        if is_temp:
+            domain = _wait_temp_domain()
+            if domain:
+                log(f'watchdog: new ArgoDomain: {domain}')
+                generate_links(domain)
+                return True
+            log_error('watchdog: cloudflared restarted but no new temp domain yet; will retry next cycle')
+            return False
+    return True
+
+
+def _watchdog_loop():
+    while not _shutdown_event.is_set():
+        if _shutdown_event.wait(WATCHDOG_INTERVAL):
+            break
+        with _children_lock:
+            items = list(_children.items())
+        for name, record in items:
+            if _shutdown_event.is_set():
+                break
+            proc = record['proc']
+            if proc is None or proc.poll() is None:
+                if proc is not None and time.monotonic() - record.get('started_at', 0) > 60:
+                    _watchdog_failures[name] = 0
+                continue
+            failures = _watchdog_failures.get(name, 0) + 1
+            _watchdog_failures[name] = failures
+            delay = min(60, 5 * (2 ** (failures - 1)))
+            log_error(f'watchdog: {name} exited (code {proc.returncode}), restart #{failures} in {delay}s')
+            if _shutdown_event.wait(delay):
+                break
+            try:
+                _restart_child(name)
+            except Exception as e:
+                log_error(f'watchdog: restart {name} failed: {e}')
+
+
+def _start_watchdog():
+    """在节点生成完成后启动看门狗（只启动一次）。"""
+    global _watchdog_started
+    if not WATCHDOG_ENABLED or _watchdog_started:
+        return
+    _watchdog_started = True
+    t = threading.Thread(target=_watchdog_loop, daemon=True)
+    t.start()
+    log(f'watchdog started (interval {WATCHDOG_INTERVAL}s)')
 
 # =========================== 下载并运行 ===========================
 def download_files_and_run():
@@ -698,7 +886,7 @@ def download_files_and_run():
         generate_cf_probe_config()
         debug_arg = '-debug=1' if CFP_DEBUG == '1' else '-debug=0'
         cfp_bin = live_binary(cf_probe_path, BUILTIN_CFP)
-        if run_daemon([cfp_bin, 'run', '-config', str(cf_probe_config_path), debug_arg]):
+        if _start_child('cfprobe', [cfp_bin, 'run', '-config', str(cf_probe_config_path), debug_arg]):
             log(f'{cf_probe_name} (cf-probe) is running')
             time.sleep(1)
     else:
@@ -706,28 +894,15 @@ def download_files_and_run():
 
     # 运行 Xray
     web_bin = live_binary(web_path, BUILTIN_XRAY)
-    if run_daemon([web_bin, '-c', str(config_path)]):
+    if _start_child('xray', [web_bin, '-c', str(config_path)]):
         log(f'{web_name} is running')
         time.sleep(1)
 
     # 运行 Cloudflared（参数列表形式传递，ARGO_AUTH 不经过 shell，无注入风险）
     bot_bin = live_binary(bot_path, BUILTIN_BOT)
     if Path(bot_bin).is_file():
-        auth = ARGO_AUTH or ''
-        if re.match(r'^[A-Z0-9a-z=]{120,250}$', auth):
-            argv = [bot_bin, 'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
-                    '--protocol', 'http2', 'run', '--token', auth]
-        elif 'TunnelSecret' in auth:
-            argv = [bot_bin, 'tunnel', '--edge-ip-version', 'auto',
-                    '--config', str(FILE_PATH / 'tunnel.yml'), 'run']
-        else:
-            if auth:
-                log_error('ARGO_AUTH 格式无法识别（既不是 token 也不是 TunnelSecret JSON），已降级为临时隧道')
-            argv = [bot_bin, 'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
-                    '--protocol', 'http2', '--logfile', str(boot_log_path),
-                    '--loglevel', 'info', '--url', f'http://localhost:{ARGO_PORT}']
-
-        if run_daemon(argv):
+        argv, _is_temp = _cloudflared_argv()
+        if _start_child('cloudflared', argv):
             log(f'{bot_name} is running')
             time.sleep(2)
 
@@ -765,13 +940,11 @@ def extract_domains(max_retries=5):
                 boot_log_path.unlink(missing_ok=True)
             except Exception:
                 pass
-            pkill_match(bot_name)
+            # 经 _stop_child/_start_child 重启，登记在 _children 里，看门狗才能接着管它
+            _stop_child('cloudflared')
             time.sleep(3)
-            argv = [live_binary(bot_path, BUILTIN_BOT), 'tunnel',
-                    '--edge-ip-version', 'auto', '--no-autoupdate',
-                    '--protocol', 'http2', '--logfile', str(boot_log_path),
-                    '--loglevel', 'info', '--url', f'http://localhost:{ARGO_PORT}']
-            if run_daemon(argv):
+            argv, _is_temp = _cloudflared_argv()
+            if _start_child('cloudflared', argv):
                 log(f'{bot_name} is running')
             time.sleep(6)
 
@@ -949,9 +1122,11 @@ def clean_files():
     def cleanup():
         time.sleep(90)
         # 注意: key.txt/cert.pem/private.key 不能删除, 删除后重启会导致 Reality 公钥和 Hysteria2 证书指纹变化, 节点失效
-        files_to_delete = [boot_log_path, config_path, list_path, cf_probe_config_path,
-                           web_path, bot_path, cf_probe_path,
-                           FILE_PATH / 'tunnel.json', FILE_PATH / 'tunnel.yml']
+        # 同理 config.json / cfprobe.conf / tunnel.json / tunnel.yml 也不能删：
+        # 看门狗重启 xray / cf-probe / 固定隧道要靠它们；删了重启就起不来。
+        # 二进制副本（web/bot/cfprobe 运行副本）可以删，重启时 _resolve_argv() 会回退到 /opt/bin。
+        files_to_delete = [boot_log_path, list_path,
+                           web_path, bot_path, cf_probe_path]
 
         for f in files_to_delete:
             try:
@@ -1045,7 +1220,10 @@ def start_server():
     upload_nodes()
     add_visit_task()
 
-    # 10. 90秒后清理文件
+    # 10. 启动看门狗（节点已生成，此后子进程死了自动拉起）
+    _start_watchdog()
+
+    # 11. 90秒后清理文件
     clean_files()
 
 # =========================== 信号处理 ===========================
@@ -1053,6 +1231,13 @@ def stop_all(signum=None, frame=None):
     """优雅关闭所有服务"""
     def shutdown():
         log('\nShutting down...')
+        _shutdown_event.set()  # 先停看门狗，免得它在关停时又把进程拉起来
+        for _name in ('xray', 'cloudflared', 'cfprobe'):
+            try:
+                _stop_child(_name)
+            except Exception:
+                pass
+        # 兜底：清掉 _children 之外的孤儿进程
         pkill_match(web_name)
         pkill_match(bot_name)
         if CFP_ID and CFP_SECRET and CFP_URL:
