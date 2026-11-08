@@ -5,7 +5,10 @@
 #   - 构建时固化 web / bot / cfprobe 到 /opt/bin
 #   - 运行时优先复制内置为随机名；缺失才下载
 # ============================================================
-FROM golang:1.26-alpine AS binbuilder
+# 注意：上游 cfsm-agent 的 go.mod 自 2026-10-21（cbd0836）起要求 go >= 1.27.3，
+# 1.26 构建会以 "go.mod requires go >= 1.27.3 (running go 1.26.10; GOTOOLCHAIN=local)"
+# 失败（2026-11-08 构建 42461022902 就是这么挂的）。上游再升 Go 版本时这里要跟着升。
+FROM golang:1.27.3-alpine AS binbuilder
 ARG TARGETPLATFORM
 ARG CFSM_AGENT_REPO=https://github.com/huilang-me/cfsm-agent.git
 # 可选：构建时校验下载的二进制（docker build --build-arg XRAY_SHA256=...）
